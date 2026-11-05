@@ -1,4 +1,4 @@
-const CACHE_NAME = "autocare-pro-v1";
+const CACHE_NAME = "autocare-pro-v2";
 const STATIC_ASSETS = [
   "/",
   "/dashboard",
@@ -32,8 +32,12 @@ self.addEventListener("activate", (event) => {
 });
 
 self.addEventListener("fetch", (event) => {
-  // Never intercept API routes or non-GET requests with service worker static cache
-  if (event.request.url.includes("/api/") || event.request.method !== "GET") {
+  // Never intercept API routes, Next.js HMR/chunks, or non-GET requests
+  if (
+    event.request.url.includes("/api/") ||
+    event.request.url.includes("/_next/") ||
+    event.request.method !== "GET"
+  ) {
     return;
   }
 

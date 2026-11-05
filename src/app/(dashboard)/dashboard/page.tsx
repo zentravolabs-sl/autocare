@@ -1,296 +1,596 @@
 import React from "react";
-import Link from "next/link";
-import {
-  Wrench,
-  Clock,
-  Car,
-  AlertCircle,
-  TrendingUp,
-  CheckCircle,
-  PlusCircle,
-  ShoppingBag,
-  ArrowRight,
-  ShieldCheck,
-  Building2,
-  Calendar,
-} from "lucide-react";
+import { redirect } from "next/navigation";
 import { prisma } from "@/lib/db/prisma";
+import { getAuthenticatedUser, getCurrentSession } from "@/lib/auth/session";
 import { getTenantContext } from "@/lib/tenant/context";
-import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { formatCurrencyLKR, formatDateLK, formatDateTimeLK } from "@/lib/utils";
-
+import { fetchAccountSums, buildProfitAndLoss } from "@/lib/accounting/reports";
+import {
+  BentoDashboard,
+  BentoDashboardStats,
+} from "@/components/dashboard/bento-dashboard";
 
 export default async function DashboardPage() {
-  const { organizationId, branchId } = await getTenantContext();
+  const session = await getCurrentSession();
+  if (!session) {
+    redirect("/login");
+  }
 
-  // Query real tenant statistics from PostgreSQL
+  const user = await getAuthenticatedUser();
+  if (!user) {
+    redirect("/login");
+  }
+
+  const tenant = await getTenantContext();
+  let organizationId = tenant.organizationId;
+  let branchId = tenant.branchId;
+
+  // If platform super admin navigates to /dashboard without an explicit organizationId, load default active org
+  if (!organizationId && session.isSuperAdmin) {
+    const firstOrg = await prisma.organization.findFirst({
+      where: { status: "ACTIVE" },
+      include: { branches: { where: { status: "ACTIVE" } } },
+    });
+    if (firstOrg) {
+      organizationId = firstOrg.id;
+      branchId = branchId || firstOrg.branches[0]?.id || "";
+    }
+  }
+
+  const branchFilter = branchId ? { branchId } : {};
+  const startOfToday = new Date();
+  startOfToday.setHours(0, 0, 0, 0);
+
+  // Query real tenant & branch statistics from PostgreSQL in parallel
   const [
     org,
-    activeJobsCount,
-    pendingEstimatesCount,
-    totalVehiclesCount,
-    workshopBays,
+    allJobCards,
     recentJobCards,
+    parts,
+    services,
+    serviceCategoriesCount,
+    activeJobTasksCount,
+    completedJobTasksCount,
+    accountSums,
+    invoices,
+    expensesAgg,
+    todayPaymentsAgg,
+    totalCustomersCount,
+    corporateCustomersCount,
+    totalVehiclesCount,
+    hybridEvVehiclesCount,
+    totalTechniciansCount,
+    activeTimeLogsCount,
+    upcomingAppointmentsCount,
+    totalAppointmentsCount,
+    diagnosticSessionsCount,
+    activeDiagnosticCodes,
+    posInvoicesCount,
+    cashRegistersCount,
+    suppliersCount,
+    purchaseOrdersCount,
+    grnCount,
+    branchesCount,
+    workshopBays,
+    auditLogsCount,
+    journalEntriesCount,
+    searchCustomers,
+    searchVehicles,
   ] = await Promise.all([
     prisma.organization.findUnique({
       where: { id: organizationId },
       include: {
         subscription: {
-          include: { plan: true },
+          include: {
+            plan: {
+              include: { features: true },
+            },
+          },
+        },
+        branches: {
+          where: { status: "ACTIVE" },
+          orderBy: { isMain: "desc" },
         },
       },
     }),
-    prisma.jobCard.count({
-      where: {
-        organizationId,
-        stage: { notIn: ["CLOSED", "CANCELLED"] },
+    prisma.jobCard.findMany({
+      where: { organizationId, ...branchFilter },
+      select: {
+        id: true,
+        stage: true,
+        estimatedLaborCost: true,
+        estimatedPartsCost: true,
+        estimatedTotalCost: true,
+        actualLaborCost: true,
+        actualPartsCost: true,
+        actualTotalCost: true,
       },
-    }),
-    prisma.jobCard.count({
-      where: {
-        organizationId,
-        stage: "CUSTOMER_APPROVAL",
-      },
-    }),
-    prisma.vehicle.count({
-      where: { organizationId },
-    }),
-    prisma.workshopBay.findMany({
-      where: { organizationId },
-      take: 5,
     }),
     prisma.jobCard.findMany({
-      where: { organizationId },
+      where: { organizationId, ...branchFilter },
       include: {
         customer: true,
         vehicle: true,
         bay: true,
       },
       orderBy: { createdAt: "desc" },
-      take: 6,
+      take: 10,
+    }),
+    prisma.part.findMany({
+      where: { organizationId, isActive: true },
+      include: {
+        stocks: branchId ? { where: { branchId } } : true,
+      },
+      orderBy: { name: "asc" },
+    }),
+    prisma.service.findMany({
+      where: { organizationId, isActive: true },
+      orderBy: { createdAt: "asc" },
+    }),
+    prisma.serviceCategory.count({
+      where: { organizationId },
+    }),
+    prisma.jobTask.count({
+      where: {
+        jobCard: { organizationId, ...branchFilter },
+        status: { in: ["PENDING", "ASSIGNED", "IN_PROGRESS", "PAUSED"] },
+      },
+    }),
+    prisma.jobTask.count({
+      where: {
+        jobCard: { organizationId, ...branchFilter },
+        status: "COMPLETED",
+      },
+    }),
+    fetchAccountSums(prisma, organizationId),
+    prisma.invoice.findMany({
+      where: {
+        organizationId,
+        ...branchFilter,
+        status: { not: "CANCELLED" },
+      },
+      select: {
+        id: true,
+        type: true,
+        status: true,
+        totalAmount: true,
+        paidAmount: true,
+        balanceAmount: true,
+        createdAt: true,
+      },
+    }),
+    prisma.expense.aggregate({
+      where: {
+        organizationId,
+        ...branchFilter,
+        status: "APPROVED",
+      },
+      _sum: { amount: true },
+    }),
+    prisma.payment.aggregate({
+      where: {
+        organizationId,
+        ...branchFilter,
+        receivedAt: { gte: startOfToday },
+      },
+      _sum: { amount: true },
+    }),
+    prisma.customer.count({
+      where: { organizationId },
+    }),
+    prisma.customer.count({
+      where: { organizationId, type: "CORPORATE" },
+    }),
+    prisma.vehicle.count({
+      where: { organizationId },
+    }),
+    prisma.vehicle.count({
+      where: {
+        organizationId,
+        vehicleType: { in: ["HYBRID", "ELECTRIC"] },
+      },
+    }),
+    prisma.employee.count({
+      where: { organizationId, ...branchFilter, status: "ACTIVE" },
+    }),
+    prisma.jobTimeLog.count({
+      where: {
+        endTime: null,
+        task: { jobCard: { organizationId, ...branchFilter } },
+      },
+    }),
+    prisma.appointment.count({
+      where: {
+        organizationId,
+        ...branchFilter,
+        status: { in: ["PENDING", "CONFIRMED"] },
+      },
+    }),
+    prisma.appointment.count({
+      where: { organizationId, ...branchFilter },
+    }),
+    prisma.diagnosticSession.count({
+      where: {
+        jobCard: { organizationId, ...branchFilter },
+      },
+    }),
+    prisma.diagnosticCode.findMany({
+      where: {
+        session: { jobCard: { organizationId, ...branchFilter } },
+        status: { in: ["DETECTED", "PENDING_REPAIR"] },
+      },
+      orderBy: { id: "desc" },
+    }),
+    prisma.invoice.count({
+      where: {
+        organizationId,
+        ...branchFilter,
+        type: { in: ["POS_DIRECT", "COUNTER_SALE"] },
+      },
+    }),
+    prisma.cashRegister.count({
+      where: { organizationId, ...branchFilter, status: "ACTIVE" },
+    }),
+    prisma.supplier.count({
+      where: { organizationId, status: "ACTIVE" },
+    }),
+    prisma.purchaseOrder.count({
+      where: { organizationId, ...branchFilter },
+    }),
+    prisma.goodsReceipt.count({
+      where: { organizationId, ...branchFilter },
+    }),
+    prisma.branch.count({
+      where: { organizationId, status: "ACTIVE" },
+    }),
+    prisma.workshopBay.findMany({
+      where: { organizationId, ...branchFilter },
+      orderBy: { code: "asc" },
+    }),
+    prisma.auditLog.count({
+      where: { organizationId },
+    }),
+    prisma.journalEntry.count({
+      where: { organizationId },
+    }),
+    prisma.customer.findMany({
+      where: { organizationId },
+      select: {
+        id: true,
+        customerCode: true,
+        firstName: true,
+        lastName: true,
+        companyName: true,
+        phone: true,
+      },
+      orderBy: { createdAt: "desc" },
+      take: 15,
+    }),
+    prisma.vehicle.findMany({
+      where: { organizationId },
+      select: {
+        id: true,
+        registrationNumber: true,
+        make: true,
+        model: true,
+      },
+      orderBy: { createdAt: "desc" },
+      take: 15,
     }),
   ]);
 
+  // 1. Job Card Breakdown
+  const activeJobCards = allJobCards.filter(
+    (j) => !["CLOSED", "CANCELLED"].includes(j.stage)
+  );
+  const pendingCount = allJobCards.filter((j) =>
+    [
+      "VEHICLE_RECEPTION",
+      "INITIAL_INSPECTION",
+      "CUSTOMER_COMPLAINT",
+      "DIAGNOSTIC_INSPECTION",
+      "ESTIMATE_CREATION",
+      "CUSTOMER_APPROVAL",
+    ].includes(j.stage)
+  ).length;
+  const readyForDeliveryCount = allJobCards.filter((j) =>
+    [
+      "QUALITY_INSPECTION",
+      "FINAL_INVOICE",
+      "PAYMENT",
+      "VEHICLE_DELIVERY",
+    ].includes(j.stage)
+  ).length;
+  const inProgressCount = allJobCards.filter((j) =>
+    [
+      "TECHNICIAN_ASSIGNMENT",
+      "PARTS_RESERVATION",
+      "REPAIR_IN_PROGRESS",
+      "QUALITY_INSPECTION",
+      "FINAL_INVOICE",
+      "PAYMENT",
+      "VEHICLE_DELIVERY",
+    ].includes(j.stage)
+  ).length;
+  const completedCount = allJobCards.filter((j) => j.stage === "CLOSED").length;
+
+  // 2. Inventory Breakdown & Subtle Visualization Data
+  let totalUnitsInStock = 0;
+  let lowStockCount = 0;
+  let inventoryValuation = 0;
+
+  const stockItems = parts.map((p) => {
+    const qoh = p.stocks.reduce((sum, s) => sum + Number(s.quantityOnHand), 0);
+    const avgCost = p.stocks[0]?.averageUnitCost
+      ? Number(p.stocks[0].averageUnitCost)
+      : Number(p.purchasePrice);
+    totalUnitsInStock += qoh;
+    inventoryValuation += qoh * avgCost;
+    const isLow = qoh <= p.minStockLevel;
+    if (isLow) lowStockCount += 1;
+    const targetMax = Math.max(p.reorderLevel * 2, p.minStockLevel * 3, 20);
+    const fillPercent = Math.min(100, Math.round((qoh / targetMax) * 100));
+
+    return {
+      id: p.id,
+      sku: p.sku,
+      name: p.name,
+      qoh,
+      minStockLevel: p.minStockLevel,
+      reorderLevel: p.reorderLevel,
+      fillPercent,
+      isLow,
+    };
+  });
+
+  // 3. Financial & Revenue Calculations (Double-Entry P&L + Invoices + WIP)
+  const pnl = buildProfitAndLoss(accountSums);
+  const ledgerRevenue = Number(pnl.totalRevenue);
+  const ledgerExpenses = Number(pnl.totalExpenses);
+  const directExpenses = Number(expensesAgg._sum.amount || 0);
+
+  const finalizedInvoices = invoices.filter((i) =>
+    ["FINALIZED", "PAID", "PARTIAL"].includes(i.status)
+  );
+  const invoicedRevenue = finalizedInvoices.reduce(
+    (sum, i) => sum + Number(i.totalAmount),
+    0
+  );
+  const totalCollected = finalizedInvoices.reduce(
+    (sum, i) => sum + Number(i.paidAmount),
+    0
+  );
+  const outstandingReceivables = finalizedInvoices.reduce(
+    (sum, i) => sum + Number(i.balanceAmount),
+    0
+  );
+
+  const totalRevenue = ledgerRevenue > 0 ? ledgerRevenue : invoicedRevenue;
+  const totalExpenses = ledgerExpenses > 0 ? ledgerExpenses : directExpenses;
+  const netProfit = totalRevenue - totalExpenses;
+
+  const wipLaborValue = activeJobCards.reduce(
+    (sum, j) =>
+      sum + Number(j.actualLaborCost || j.estimatedLaborCost || 0),
+    0
+  );
+  const wipPartsValue = activeJobCards.reduce(
+    (sum, j) =>
+      sum + Number(j.actualPartsCost || j.estimatedPartsCost || 0),
+    0
+  );
+  const wipPipelineValue = activeJobCards.reduce(
+    (sum, j) =>
+      sum + Number(j.actualTotalCost || j.estimatedTotalCost || 0),
+    0
+  );
+
+  const todayPaymentsReceived = Number(todayPaymentsAgg._sum.amount || 0);
+  const todayInvoicedRevenue = finalizedInvoices
+    .filter((i) => new Date(i.createdAt) >= startOfToday)
+    .reduce((sum, i) => sum + Number(i.totalAmount), 0);
+  const todayIncome =
+    todayPaymentsReceived > 0
+      ? todayPaymentsReceived
+      : todayInvoicedRevenue > 0
+      ? todayInvoicedRevenue
+      : totalRevenue > 0
+      ? totalRevenue
+      : wipPipelineValue;
+
+  const chartPoints = [
+    {
+      label: "Labor",
+      revenue: totalRevenue > 0 ? totalRevenue * 0.45 : wipLaborValue,
+      expense: totalExpenses * 0.4,
+    },
+    {
+      label: "Parts",
+      revenue: totalRevenue > 0 ? totalRevenue * 0.55 : wipPartsValue,
+      expense: totalExpenses * 0.6,
+    },
+    {
+      label: "Billed",
+      revenue: totalRevenue,
+      expense: totalExpenses,
+    },
+    {
+      label: "WIP",
+      revenue: wipPipelineValue,
+      expense: totalExpenses,
+    },
+  ];
+
+  // 4. Workshop Bays & AI Insights Metrics
+  const availableBaysCount = workshopBays.filter(
+    (b) => b.status === "AVAILABLE"
+  ).length;
+  const occupiedBaysCount = workshopBays.filter(
+    (b) => b.status === "OCCUPIED"
+  ).length;
+  const bayUtilizationPct =
+    workshopBays.length > 0
+      ? Math.round((occupiedBaysCount / workshopBays.length) * 100)
+      : 0;
+
+  const branches =
+    org?.branches.map((b) => ({
+      id: b.id,
+      code: b.code,
+      name: b.name,
+      isMain: b.isMain,
+    })) || [];
+
+  const activeBranchId = branchId || branches[0]?.id || null;
+
+  const planFeatures = org?.subscription?.plan?.features || [];
+  const aiFeature = planFeatures.find((f) => f.featureKey === "aiTokensPerMonth");
+  const aiEnabled = aiFeature ? aiFeature.isEnabled : true;
+
+  const stats: BentoDashboardStats = {
+    organization: {
+      name: org?.name || "AutoCare Pro",
+      code: org?.code || "ENTERPRISE",
+      currency: org?.currency || "LKR",
+      planName: org?.subscription?.plan?.name || "Standard Plan",
+      subscriptionStatus: org?.subscription?.status || "ACTIVE",
+      aiEnabled,
+    },
+    jobCards: {
+      activeCount: activeJobCards.length,
+      pendingCount,
+      readyForDeliveryCount,
+      inProgressCount,
+      completedCount,
+      totalCount: allJobCards.length,
+      recent: recentJobCards.map((jc) => ({
+        id: jc.id,
+        jobNumber: jc.jobNumber,
+        registrationNumber: jc.vehicle.registrationNumber,
+        vehicleName: `${jc.vehicle.make} ${jc.vehicle.model}`,
+        customerName: `${jc.customer.firstName} ${jc.customer.lastName || ""}`.trim(),
+        stage: jc.stage,
+        priority: jc.priority,
+        estimatedTotalCost: Number(
+          jc.actualTotalCost || jc.estimatedTotalCost || 0
+        ),
+      })),
+    },
+    inventory: {
+      totalPartsCount: parts.length,
+      totalUnitsInStock,
+      lowStockCount,
+      healthyStockCount: Math.max(parts.length - lowStockCount, 0),
+      inventoryValuation,
+      stockItems,
+    },
+    services: {
+      totalServicesCount: services.length,
+      categoriesCount: serviceCategoriesCount,
+      activeTasksCount: activeJobTasksCount,
+      completedTasksCount: completedJobTasksCount,
+      topServices: services.slice(0, 4).map((s) => ({
+        id: s.id,
+        code: s.code,
+        name: s.name,
+        estimatedPrice: Number(s.estimatedPrice),
+        standardLaborHours: Number(s.standardLaborHours),
+      })),
+    },
+    finance: {
+      todayIncome,
+      totalRevenue,
+      totalCollected,
+      totalExpenses,
+      netProfit,
+      wipPipelineValue,
+      outstandingReceivables,
+      chartPoints,
+    },
+    customers: {
+      totalCount: totalCustomersCount,
+      corporateCount: corporateCustomersCount,
+      recent: searchCustomers.map((c) => ({
+        id: c.id,
+        code: c.customerCode,
+        name: c.companyName || `${c.firstName} ${c.lastName || ""}`.trim(),
+        phone: c.phone,
+      })),
+    },
+    vehicles: {
+      totalCount: totalVehiclesCount,
+      hybridEvCount: hybridEvVehiclesCount,
+      recent: searchVehicles.map((v) => ({
+        id: v.id,
+        registrationNumber: v.registrationNumber,
+        name: `${v.make} ${v.model}`,
+      })),
+    },
+    technicians: {
+      totalCount: totalTechniciansCount,
+      activeTimersCount: activeTimeLogsCount,
+    },
+    appointments: {
+      upcomingCount: upcomingAppointmentsCount,
+      totalCount: totalAppointmentsCount,
+    },
+    diagnostics: {
+      sessionsCount: diagnosticSessionsCount,
+      activeDtcCount: activeDiagnosticCodes.length,
+      latestDtcCode: activeDiagnosticCodes[0]?.dtcCode || null,
+    },
+    pos: {
+      counterSalesCount: posInvoicesCount,
+      registersCount: cashRegistersCount,
+    },
+    suppliers: {
+      activeCount: suppliersCount,
+    },
+    purchases: {
+      ordersCount: purchaseOrdersCount,
+      grnCount,
+    },
+    branches: {
+      activeCount: branchesCount,
+    },
+    bays: {
+      totalCount: workshopBays.length,
+      availableCount: availableBaysCount,
+      occupiedCount: occupiedBaysCount,
+      items: workshopBays.map((b) => ({
+        id: b.id,
+        code: b.code,
+        name: b.name,
+        status: b.status,
+      })),
+    },
+    invoices: {
+      totalCount: invoices.length,
+      finalizedCount: finalizedInvoices.length,
+    },
+    reports: {
+      auditLogsCount,
+      journalEntriesCount,
+    },
+    aiInsights: {
+      monitoredVehicles: totalVehiclesCount,
+      criticalAlertsCount: activeDiagnosticCodes.length,
+      bayUtilizationPct,
+    },
+  };
+
   return (
-    <div className="space-y-6 font-sans">
-      {/* Welcome Banner */}
-      <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-4 rounded-2xl bg-gradient-to-r from-[#0B132B] via-[#1C2541] to-[#2563EB] p-6 text-white shadow-lg">
-        <div className="space-y-1">
-          <div className="flex items-center gap-2">
-            <span className="text-xs font-mono font-semibold uppercase tracking-widest text-blue-300">
-              {org?.name || "Apex Auto Care"} • {org?.currency || "LKR"} Workspace
-            </span>
-            <Badge variant="info" className="bg-blue-500/20 text-blue-200 border-blue-400/30">
-              {org?.subscription?.plan?.name || "Standard Plan"}
-            </Badge>
-          </div>
-          <h1 className="text-2xl lg:text-3xl font-extrabold tracking-tight">
-            Workshop Operating Console
-          </h1>
-          <p className="text-xs lg:text-sm text-slate-300">
-            Real-time mechanical workflow, live lift allocations, and technician tracking.
-          </p>
-        </div>
-
-        <div className="flex items-center gap-2.5">
-          <Link href="/dashboard/pos">
-            <Button variant="secondary" size="sm" className="gap-2 bg-slate-900/80 text-white hover:bg-slate-800">
-              <ShoppingBag className="h-4 w-4" />
-              <span>POS Billing</span>
-            </Button>
-          </Link>
-          <Link href="/dashboard/job-cards">
-            <Button size="sm" className="gap-2 bg-blue-500 hover:bg-blue-600 font-bold shadow-md shadow-blue-500/30">
-              <PlusCircle className="h-4 w-4" />
-              <span>Intake New Job</span>
-            </Button>
-          </Link>
-        </div>
-      </div>
-
-      {/* Primary KPI Stats */}
-      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <Card>
-          <CardContent className="p-4 flex items-center justify-between">
-            <div className="space-y-1">
-              <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Active Jobs in Bay</p>
-              <h3 className="text-2xl font-black text-slate-900 dark:text-white">{activeJobsCount}</h3>
-              <p className="text-[11px] text-blue-600 dark:text-blue-400 flex items-center gap-1 font-medium">
-                <Clock className="h-3 w-3" /> Live In-Progress
-              </p>
-            </div>
-            <div className="p-3 rounded-xl bg-blue-50 text-blue-600 dark:bg-blue-950/50 dark:text-blue-400">
-              <Wrench className="h-5 w-5" />
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="p-4 flex items-center justify-between">
-            <div className="space-y-1">
-              <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Pending Approvals</p>
-              <h3 className="text-2xl font-black text-amber-600 dark:text-amber-400">{pendingEstimatesCount}</h3>
-              <p className="text-[11px] text-amber-600 dark:text-amber-400 flex items-center gap-1 font-medium">
-                <AlertCircle className="h-3 w-3" /> Awaiting Customer Sign-off
-              </p>
-            </div>
-            <div className="p-3 rounded-xl bg-amber-50 text-amber-600 dark:bg-amber-950/50 dark:text-amber-400">
-              <AlertCircle className="h-5 w-5" />
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="p-4 flex items-center justify-between">
-            <div className="space-y-1">
-              <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Fleet Vehicles Vault</p>
-              <h3 className="text-2xl font-black text-slate-900 dark:text-white">{totalVehiclesCount}</h3>
-              <p className="text-[11px] text-emerald-600 dark:text-emerald-400 flex items-center gap-1 font-medium">
-                <Car className="h-3 w-3" /> Registered with History
-              </p>
-            </div>
-            <div className="p-3 rounded-xl bg-emerald-50 text-emerald-600 dark:bg-emerald-950/50 dark:text-emerald-400">
-              <Car className="h-5 w-5" />
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="p-4 flex items-center justify-between">
-            <div className="space-y-1">
-              <p className="text-xs font-semibold text-slate-500 uppercase tracking-wider">Workshop Bays</p>
-              <h3 className="text-2xl font-black text-slate-900 dark:text-white">{workshopBays.length}</h3>
-              <p className="text-[11px] text-purple-600 dark:text-purple-400 flex items-center gap-1 font-medium">
-                <Building2 className="h-3 w-3" /> Lifts & Diagnostic Pits
-              </p>
-            </div>
-            <div className="p-3 rounded-xl bg-purple-50 text-purple-600 dark:bg-purple-950/50 dark:text-purple-400">
-              <Building2 className="h-5 w-5" />
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Grid: Workshop Bays Overview & Recent Job Cards */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Left Column (2 cols): Recent Active Job Cards */}
-        <div className="lg:col-span-2 space-y-4">
-          <Card>
-            <CardHeader className="flex flex-row items-center justify-between pb-3">
-              <div>
-                <CardTitle className="text-base font-bold">Active Workshop Job Cards</CardTitle>
-                <CardDescription className="text-xs">
-                  Latest vehicle intakes and progress through the 14-stage workflow
-                </CardDescription>
-              </div>
-              <Link href="/dashboard/job-cards">
-                <Button variant="ghost" size="sm" className="text-xs text-blue-600 gap-1">
-                  <span>View All</span>
-                  <ArrowRight className="h-3.5 w-3.5" />
-                </Button>
-              </Link>
-            </CardHeader>
-            <CardContent>
-              {recentJobCards.length === 0 ? (
-                <div className="p-8 text-center text-xs text-slate-400">
-                  No job cards created yet. Click "Intake New Job" to begin.
-                </div>
-              ) : (
-                <div className="divide-y divide-slate-100 dark:divide-slate-800">
-                  {recentJobCards.map((job) => (
-                    <div
-                      key={job.id}
-                      className="flex flex-col sm:flex-row sm:items-center justify-between py-3.5 gap-2 hover:bg-slate-50/50 dark:hover:bg-slate-800/30 rounded-lg px-2 transition-colors"
-                    >
-                      <div className="space-y-1">
-                        <div className="flex items-center gap-2">
-                          <span className="font-mono font-bold text-xs text-blue-600 dark:text-blue-400">
-                            {job.jobNumber}
-                          </span>
-                          <span className="font-bold text-xs text-slate-900 dark:text-white">
-                            {job.vehicle.registrationNumber}
-                          </span>
-                          <span className="text-xs text-slate-500">
-                            ({job.vehicle.make} {job.vehicle.model})
-                          </span>
-                        </div>
-                        <p className="text-xs text-slate-500 line-clamp-1">
-                          Client: <span className="font-medium text-slate-700 dark:text-slate-300">{job.customer.firstName} {job.customer.lastName || ""}</span> • Bay: {job.bay?.name || "Unassigned"}
-                        </p>
-                      </div>
-
-                      <div className="flex items-center gap-3 shrink-0">
-                        <Badge
-                          variant={
-                            job.stage === "REPAIR_IN_PROGRESS"
-                              ? "info"
-                              : job.stage === "CLOSED"
-                              ? "success"
-                              : "warning"
-                          }
-                          className="font-mono text-[10px]"
-                        >
-                          {job.stage.replace(/_/g, " ")}
-                        </Badge>
-                        <span className="font-bold text-xs text-slate-900 dark:text-white font-mono">
-                          {formatCurrencyLKR(job.estimatedTotalCost)}
-                        </span>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </CardContent>
-          </Card>
-        </div>
-
-        {/* Right Column: Workshop Bay Statuses */}
-        <div className="space-y-4">
-          <Card>
-            <CardHeader className="pb-3">
-              <CardTitle className="text-base font-bold flex items-center gap-2">
-                <Building2 className="h-4 w-4 text-blue-600" /> Workshop Bay Live Allocations
-              </CardTitle>
-              <CardDescription className="text-xs">
-                Physical hoist, lift, and computerized alignment stations
-              </CardDescription>
-            </CardHeader>
-            <CardContent>
-              <div className="space-y-2.5">
-                {workshopBays.map((bay) => (
-                  <div
-                    key={bay.id}
-                    className="flex items-center justify-between p-3 rounded-lg border border-slate-100 dark:border-slate-800 bg-slate-50/60 dark:bg-slate-900/60"
-                  >
-                    <div className="space-y-0.5">
-                      <div className="flex items-center gap-2">
-                        <span className="font-mono text-xs font-bold text-slate-900 dark:text-white">
-                          {bay.code}
-                        </span>
-                        <span className="text-xs font-medium text-slate-700 dark:text-slate-300 truncate max-w-[150px]">
-                          {bay.name}
-                        </span>
-                      </div>
-                      <span className="text-[10px] text-slate-400 uppercase font-mono">
-                        {bay.bayType}
-                      </span>
-                    </div>
-
-                    <Badge
-                      variant={bay.status === "AVAILABLE" ? "success" : "danger"}
-                      className="text-[10px]"
-                    >
-                      {bay.status}
-                    </Badge>
-                  </div>
-                ))}
-              </div>
-            </CardContent>
-          </Card>
-        </div>
-      </div>
-    </div>
+    <BentoDashboard
+      user={{
+        id: user.id,
+        name: `${user.firstName} ${user.lastName}`.trim(),
+        email: user.email,
+        isSuperAdmin: user.isSuperAdmin,
+        roles: session.roles || [],
+        permissions: session.permissions || [],
+      }}
+      branches={branches}
+      activeBranchId={activeBranchId}
+      stats={stats}
+    />
   );
 }

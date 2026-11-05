@@ -10,6 +10,7 @@ import {
   ChevronDown,
   PlusCircle,
   RefreshCw,
+  LayoutGrid,
 } from "lucide-react";
 import Link from "next/link";
 import { Badge } from "@/components/ui/badge";
@@ -64,7 +65,15 @@ export function Header({ user, branches, activeBranchId }: HeaderProps) {
   return (
     <header className="sticky top-0 z-20 flex h-16 w-full items-center justify-between border-b border-slate-200/80 bg-white/95 px-6 backdrop-blur dark:border-slate-800 dark:bg-slate-900/95 transition-all">
       {/* Search Bar */}
-      <div className="flex items-center gap-4 flex-1 max-w-md">
+      <div className="flex items-center gap-3 flex-1 max-w-lg">
+        <Link
+          href="/dashboard"
+          className="inline-flex items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-3 py-1.5 text-xs font-semibold text-slate-700 hover:border-cyan-500/50 hover:text-cyan-500 dark:border-slate-800 dark:bg-slate-950 dark:text-slate-200 transition-colors shrink-0"
+          title="Return to Bento Home Dashboard"
+        >
+          <LayoutGrid className="h-3.5 w-3.5 text-cyan-500" />
+          <span className="hidden sm:inline">Home</span>
+        </Link>
         <div className="relative w-full">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-400" />
           <input
